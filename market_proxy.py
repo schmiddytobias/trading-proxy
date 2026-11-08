@@ -6,9 +6,9 @@ from pydantic import BaseModel
 import requests
 import yfinance as yf
 
-app = FastAPI(title="Bloomberg Terminal Market Proxy", version="2.2")
+app = FastAPI(title="Bloomberg Terminal Market Proxy", version="2.3")
 
-# CORS freischalten, damit das Web-Dashboard ungehindert zugreifen kann
+# CORS freischalten für direkten Browser-Zugriff
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,11 +26,28 @@ class BatchRequest(BaseModel):
     identifiers: List[str]
 
 
-# ================= HILFSFUNKTIONEN FÜR NORMALISIERUNG =================
+# ================= INTELLIGENTES MAPPING (LAND & BRANCHE) =================
 
-def map_country(country_str: Optional[str]) -> str:
+def map_country(country_str: Optional[str], identifier: str = "") -> str:
+    clean_id = identifier.strip().upper()
+
+    # 1. Höchste Priorität: ISIN-Ländercode oder Ticker-Suffix
+    if clean_id.startswith("US") or ("." not in clean_id and len(clean_id) <= 5 and not clean_id.isdigit()):
+        return "USA"
+    if clean_id.startswith("DE") or clean_id.endswith(".DE") or clean_id.endswith(".F"):
+        return "Deutschland"
+    if clean_id.startswith("CH") or clean_id.endswith(".SW"):
+        return "Europa (ex DE)"
+    if clean_id.startswith("FR") or clean_id.endswith(".PA"):
+        return "Europa (ex DE)"
+    if clean_id.startswith("GB") or clean_id.endswith(".L"):
+        return "Europa (ex DE)"
+    if clean_id.startswith("NL") or clean_id.endswith(".AS"):
+        return "Europa (ex DE)"
+
     if not country_str:
         return "Global"
+
     c = country_str.lower()
     if any(k in c for k in ["united states", "usa", "us"]):
         return "USA"
@@ -40,27 +57,48 @@ def map_country(country_str: Optional[str]) -> str:
         return "Europa (ex DE)"
     if any(k in c for k in ["china", "japan", "taiwan", "korea", "india", "hong kong", "singapore"]):
         return "Asien / EM"
+
     return "Sonstige"
 
 
-def map_sector(sector_str: Optional[str]) -> str:
-    if not sector_str:
-        return "Sonstige"
-    s = sector_str.lower()
-    if any(k in s for k in ["tech", "software", "semiconductor", "it", "internet"]):
+def map_sector(sector_str: Optional[str], name_str: str = "", industry_str: Optional[str] = "") -> str:
+    combined = f"{sector_str or ''} {name_str or ''} {industry_str or ''}".lower()
+
+    # Technologie (inkl. Google/Alphabet, Meta, Software, Halbleiter, Internet)
+    if any(k in combined for k in [
+        "tech", "software", "semiconductor", "it", "internet", 
+        "communication", "interactive media", "google", "alphabet", 
+        "microsoft", "apple", "nvidia", "sap"
+    ]):
         return "Technologie"
-    if any(k in s for k in ["industr", "aerospace", "defen", "machin"]):
+
+    # Industrie / Rüstung
+    if any(k in combined for k in [
+        "industr", "aerospace", "defen", "machin", "rheinmetall", 
+        "hensoldt", "lockheed", "airbus", "siemens"
+    ]):
         return "Industrie / Rüstung"
-    if any(k in s for k in ["financ", "bank", "insur"]):
+
+    # Finanzen & Banken
+    if any(k in combined for k in ["financ", "bank", "insur", "allianz", "münchener rück", "jpmorgan", "visa"]):
         return "Finanzen"
-    if any(k in s for k in ["health", "pharma", "biotech"]):
+
+    # Gesundheit / Pharma
+    if any(k in combined for k in ["health", "pharma", "biotech", "medical"]):
         return "Gesundheit"
-    if any(k in s for k in ["consum", "retail"]):
+
+    # Konsumgüter & Einzelhandel
+    if any(k in combined for k in ["consum", "retail", "amazon", "beiersdorf", "nestle"]):
         return "Konsumgüter"
-    if any(k in s for k in ["energy", "oil", "gas", "basic materials", "mining", "commod"]):
+
+    # Energie, Öl & Rohstoffe
+    if any(k in combined for k in ["energy", "oil", "gas", "basic materials", "mining", "commod"]):
         return "Energie & Rohstoffe"
-    if any(k in s for k in ["communicat", "telecom"]):
+
+    # Reine Telekommunikationsnetze
+    if any(k in combined for k in ["telecom", "telekommunikation", "telefónica", "deutsche telekom"]):
         return "Telekommunikation"
+
     return "Sonstige"
 
 
@@ -165,7 +203,6 @@ def resolve_deep_security(identifier: str) -> Dict[str, Any]:
     base = resolve_single_security(identifier)
     clean_id = identifier.strip().upper()
 
-    # Nutze das über Stufe 1 aufgelöste Tickersymbol (z.B. GOOGL, SAP.DE), NICHT die rohe ISIN/WKN
     ticker_sym = base.get("symbol") or clean_id
 
     info = {}
@@ -175,7 +212,7 @@ def resolve_deep_security(identifier: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # Typ-Bestimmung absichern
+    # Typ absichern
     q_type = info.get("quoteType", "").upper()
     if not q_type:
         q_type = "ETF" if base.get("type") == "ETF" else ("MUTUALFUND" if base.get("type") == "Fonds" else "EQUITY")
@@ -190,39 +227,13 @@ def resolve_deep_security(identifier: str) -> Dict[str, Any]:
     base["type"] = sec_type
 
     if sec_type == "Aktie":
-        # 1. LAND ERMITTELN
         raw_country = info.get("country")
-        if not raw_country:
-            if ticker_sym.endswith(".DE") or ticker_sym.endswith(".F"):
-                raw_country = "Germany"
-            elif ticker_sym.endswith(".PA"):
-                raw_country = "France"
-            elif ticker_sym.endswith(".AS"):
-                raw_country = "Netherlands"
-            elif ticker_sym.endswith(".SW"):
-                raw_country = "Switzerland"
-            elif ticker_sym.endswith(".L"):
-                raw_country = "United Kingdom"
-            elif "." not in ticker_sym:
-                raw_country = "USA"
-            else:
-                raw_country = "Global"
+        raw_sector = info.get("sector")
+        raw_industry = info.get("industry")
 
-        # 2. BRANCHE ERMITTELN
-        raw_sector = info.get("sector") or info.get("industry")
-        if not raw_sector:
-            name_check = (base.get("name") or "").lower()
-            if any(k in name_check for k in ["google", "alphabet", "sap", "microsoft", "apple", "nvidia", "asml", "broadcom"]):
-                raw_sector = "Technologie"
-            elif any(k in name_check for k in ["rheinmetall", "hensoldt", "lockheed", "airbus", "siemens"]):
-                raw_sector = "Industrie / Rüstung"
-            elif any(k in name_check for k in ["allianz", "münchener rück", "jpmorgan", "visa", "bnp", "sparkasse"]):
-                raw_sector = "Finanzen"
-            else:
-                raw_sector = "Sonstige"
-
-        base["country"] = map_country(raw_country)
-        base["sector"] = map_sector(raw_sector)
+        # Priorisiertes Mapping mit ISIN/Ticker-Abgleich
+        base["country"] = map_country(raw_country, clean_id if clean_id.startswith("US") or clean_id.startswith("DE") else ticker_sym)
+        base["sector"] = map_sector(raw_sector, base.get("name", ""), raw_industry)
         base["currency"] = info.get("currency") or base.get("currency", "EUR")
 
     else:
@@ -279,7 +290,7 @@ def resolve_deep_security(identifier: str) -> Dict[str, Any]:
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "service": "Bloomberg Market Proxy v2.2"}
+    return {"status": "ok", "service": "Bloomberg Market Proxy v2.3"}
 
 
 @app.get("/quote")
@@ -318,10 +329,6 @@ def get_batch_quotes(payload: BatchRequest):
 
 
 if __name__ == "__main__":
-    import uvicorn
-    import os
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
     import uvicorn
     import os
     port = int(os.environ.get("PORT", 8000))
