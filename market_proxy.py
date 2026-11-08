@@ -6,9 +6,9 @@ from pydantic import BaseModel
 import requests
 import yfinance as yf
 
-app = FastAPI(title="Bloomberg Terminal Market Proxy", version="2.1")
+app = FastAPI(title="Bloomberg Terminal Market Proxy", version="2.2")
 
-# CORS freischalten für Browser-Zugriff
+# CORS freischalten, damit das Web-Dashboard ungehindert zugreifen kann
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,7 +47,7 @@ def map_sector(sector_str: Optional[str]) -> str:
     if not sector_str:
         return "Sonstige"
     s = sector_str.lower()
-    if any(k in s for k in ["tech", "software", "semiconductor", "it"]):
+    if any(k in s for k in ["tech", "software", "semiconductor", "it", "internet"]):
         return "Technologie"
     if any(k in s for k in ["industr", "aerospace", "defen", "machin"]):
         return "Industrie / Rüstung"
@@ -67,7 +67,10 @@ def map_sector(sector_str: Optional[str]) -> str:
 # ================= BASIS-KURSABFRAGE =================
 
 def resolve_single_security(identifier: str) -> Dict[str, Any]:
-    """Sucht Wertpapiere über Yahoo Finance und fällt bei KAG-Fonds auf Onvista zurück."""
+    """
+    Sucht ein Wertpapier über Yahoo Finance (Aktien/ETFs)
+    und fällt bei KAG-Publikumsfonds auf Onvista zurück.
+    """
     clean_id = identifier.strip().upper()
     if not clean_id:
         return {"id": identifier, "status": "error", "message": "Leere Kennnummer"}
@@ -110,7 +113,7 @@ def resolve_single_security(identifier: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # STUFE 2: Onvista Snapshot Fallback
+    # STUFE 2: Onvista Snapshot Fallback (Deka, DWS, Flossbach etc.)
     try:
         ov_search_url = f"https://api.onvista.de/api/v1/instruments/query?searchValue={clean_id}"
         ov_res = requests.get(ov_search_url, headers=HEADERS, timeout=4).json()
@@ -156,14 +159,14 @@ def resolve_single_security(identifier: str) -> Dict[str, Any]:
 
 def resolve_deep_security(identifier: str) -> Dict[str, Any]:
     """
-    Ermittelt für Aktien: Währung, Land und Branche.
+    Ermittelt für Aktien: Typ, Währung, Land und Branche.
     Ermittelt für Fonds/ETFs: Look-Through Gewichtungen (Länder, Branchen, Währungen).
     """
     base = resolve_single_security(identifier)
     clean_id = identifier.strip().upper()
 
-    ticker_sym = base.get("symbol", clean_id)
-    sec_type = base.get("type", "Aktie")
+    # Nutze das über Stufe 1 aufgelöste Tickersymbol (z.B. GOOGL, SAP.DE), NICHT die rohe ISIN/WKN
+    ticker_sym = base.get("symbol") or clean_id
 
     info = {}
     try:
@@ -172,19 +175,51 @@ def resolve_deep_security(identifier: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # Typ-Korrektur über yfinance, falls vorhanden
+    # Typ-Bestimmung absichern
     q_type = info.get("quoteType", "").upper()
+    if not q_type:
+        q_type = "ETF" if base.get("type") == "ETF" else ("MUTUALFUND" if base.get("type") == "Fonds" else "EQUITY")
+
     if q_type == "ETF":
         sec_type = "ETF"
-    elif q_type == "MUTUALFUND":
+    elif q_type in ["MUTUALFUND", "FONDS"]:
         sec_type = "Fonds"
+    else:
+        sec_type = "Aktie"
 
     base["type"] = sec_type
 
     if sec_type == "Aktie":
-        # Einzelaktien-Stammdaten
-        raw_country = info.get("country") or ("Deutschland" if ".DE" in ticker_sym else "USA")
-        raw_sector = info.get("sector") or "Technologie"
+        # 1. LAND ERMITTELN
+        raw_country = info.get("country")
+        if not raw_country:
+            if ticker_sym.endswith(".DE") or ticker_sym.endswith(".F"):
+                raw_country = "Germany"
+            elif ticker_sym.endswith(".PA"):
+                raw_country = "France"
+            elif ticker_sym.endswith(".AS"):
+                raw_country = "Netherlands"
+            elif ticker_sym.endswith(".SW"):
+                raw_country = "Switzerland"
+            elif ticker_sym.endswith(".L"):
+                raw_country = "United Kingdom"
+            elif "." not in ticker_sym:
+                raw_country = "USA"
+            else:
+                raw_country = "Global"
+
+        # 2. BRANCHE ERMITTELN
+        raw_sector = info.get("sector") or info.get("industry")
+        if not raw_sector:
+            name_check = (base.get("name") or "").lower()
+            if any(k in name_check for k in ["google", "alphabet", "sap", "microsoft", "apple", "nvidia", "asml", "broadcom"]):
+                raw_sector = "Technologie"
+            elif any(k in name_check for k in ["rheinmetall", "hensoldt", "lockheed", "airbus", "siemens"]):
+                raw_sector = "Industrie / Rüstung"
+            elif any(k in name_check for k in ["allianz", "münchener rück", "jpmorgan", "visa", "bnp", "sparkasse"]):
+                raw_sector = "Finanzen"
+            else:
+                raw_sector = "Sonstige"
 
         base["country"] = map_country(raw_country)
         base["sector"] = map_sector(raw_sector)
@@ -205,7 +240,6 @@ def resolve_deep_security(identifier: str) -> Dict[str, Any]:
                     sectors[norm_sec] = sectors.get(norm_sec, 0) + round(float(weight) * 100, 1)
 
         if not sectors:
-            # Marktrepräsentative Standard-Gewichtung (MSCI World / All-World Profil)
             sectors = {
                 "Technologie": 26.5,
                 "Finanzen": 15.2,
@@ -245,7 +279,7 @@ def resolve_deep_security(identifier: str) -> Dict[str, Any]:
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "service": "Bloomberg Market Proxy v2.1 (Deep Lookup Active)"}
+    return {"status": "ok", "service": "Bloomberg Market Proxy v2.2"}
 
 
 @app.get("/quote")
@@ -258,7 +292,7 @@ def get_single_quote(query: str):
 
 @app.get("/quote-deep")
 def get_quote_deep(query: str):
-    """Gibt Stammdaten (Land, Branche, Währung) & Fonds-Durchschau zurück."""
+    """Gibt Typ, Land, Branche, Währung & Fonds-Durchschau zurück."""
     result = resolve_deep_security(query)
     return result
 
@@ -284,6 +318,10 @@ def get_batch_quotes(payload: BatchRequest):
 
 
 if __name__ == "__main__":
+    import uvicorn
+    import os
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
     import uvicorn
     import os
     port = int(os.environ.get("PORT", 8000))
