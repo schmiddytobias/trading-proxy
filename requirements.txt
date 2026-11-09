@@ -1,5 +1,5 @@
-fastapi
-uvicorn
-requests
-pydantic
-yfinance
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+yfinance>=0.2.37
+pydantic>=2.0.0
+requests>=2.31.0
