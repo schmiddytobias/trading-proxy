@@ -8,7 +8,7 @@ import yfinance as yf
 
 app = FastAPI(title="Bloomberg Terminal Market Proxy", version="2.3")
 
-# CORS freischalten für direkten Browser-Zugriff
+# 1. CORS VOLLSTÄNDIG FREISCHALTEN (Erlaubt Zugriffe von Netlify & Browser)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -288,9 +288,13 @@ def resolve_deep_security(identifier: str) -> Dict[str, Any]:
 
 # ================= ROUTEN =================
 
+# HEALTH-CHECK ROOT ROUTE (Behebt den "Not Found" / 404 Fehler)
 @app.get("/")
 def health_check():
-    return {"status": "ok", "service": "Bloomberg Market Proxy v2.3"}
+    return {
+        "status": "ok",
+        "service": "Bloomberg Market Proxy v2.3"
+    }
 
 
 @app.get("/quote")
