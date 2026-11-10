@@ -2,17 +2,25 @@ import os
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import yfinance as yf
 
 # Logging Setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("trading-proxy")
+logger = logging.getLogger("market-proxy")
 
-app = Flask(__name__)
-# Enable CORS for all routes and origins (allowing requests from your terminal)
-CORS(app, resources={r"/*": {"origins": "*"}})
+app = FastAPI(title="Bloomberg Terminal Proxy & Cloud Engine", version="3.0")
+
+# Vollständige CORS-Freigabe für dein Terminal (Web & Handy)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 PORTFOLIO_FILE = os.path.join(os.path.dirname(__file__), "portfolio_store.json")
 
@@ -92,57 +100,50 @@ LOOKTHROUGH_DATABASE = {
     }
 }
 
-@app.route("/", methods=["GET"])
+@app.get("/")
 def health_check():
-    """Health-Check Route für Render und Terminal-Status"""
-    return jsonify({
+    return {
         "status": "online",
         "service": "Bloomberg Terminal Proxy & Cloud Engine",
         "version": "3.0"
-    }), 200
+    }
 
 # ==========================================
 # CLOUD SYNCHRONISATION (PORTFOLIO & SPARPLÄNE)
 # ==========================================
 
-@app.route("/save-portfolio", methods=["POST", "OPTIONS"])
-def save_portfolio():
-    """Speichert das Depot persistent auf dem Render-Server"""
-    if request.method == "OPTIONS":
-        return "", 200
+@app.post("/save-portfolio")
+async def save_portfolio(request: Request):
     try:
-        data = request.get_json(silent=True) or {}
+        data = await request.json()
         with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         logger.info("Depot erfolgreich in Cloud gespeichert (%d Positionen).", len(data.get("holdings", [])))
-        return jsonify({"status": "success", "message": "Portfolio in Cloud gespeichert"}), 200
+        return {"status": "success", "message": "Portfolio in Cloud gespeichert"}
     except Exception as e:
         logger.error("Fehler beim Speichern des Depots: %s", e)
-        return jsonify({"status": "error", "message": str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route("/load-portfolio", methods=["GET"])
+@app.get("/load-portfolio")
 def load_portfolio():
-    """Lädt das persistent gespeicherte Depot für Desktop & Smartphone"""
     try:
         if os.path.exists(PORTFOLIO_FILE):
             with open(PORTFOLIO_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return jsonify(data), 200
-        return jsonify({"holdings": [], "sparplaene": []}), 200
+            return data
+        return {"holdings": [], "sparplaene": []}
     except Exception as e:
         logger.error("Fehler beim Laden des Depots: %s", e)
-        return jsonify({"status": "error", "message": str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
 # KURSABFRAGEN & BATCH-QUOTES
 # ==========================================
 
-def fetch_single_quote(identifier):
-    """Holt Kursdaten für einen einzelnen Ticker/ISIN via yfinance"""
+def fetch_single_quote(identifier: str):
     clean_id = identifier.strip().upper()
     try:
         ticker = yf.Ticker(clean_id)
-        # Schnelle Abfrage über 1d history
         hist = ticker.history(period="2d")
         if hist.empty:
             info = ticker.fast_info
@@ -162,8 +163,7 @@ def fetch_single_quote(identifier):
         current_price = float(hist["Close"].iloc[-1])
         prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else current_price
         chg_pct = ((current_price - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
-        
-        # Währungsermittlung
+
         cur = "EUR" if clean_id.endswith(".DE") else "USD"
         try:
             cur = ticker.fast_info.currency or cur
@@ -180,16 +180,12 @@ def fetch_single_quote(identifier):
         logger.warning("Fehler bei Quote fuer %s: %s", clean_id, ex)
         return clean_id, {"status": "error", "message": str(ex)}
 
-@app.route("/batch-quotes", methods=["POST", "OPTIONS"])
-def batch_quotes():
-    """Parallele Kursaktualisierung für mehrere Positionen"""
-    if request.method == "OPTIONS":
-        return "", 200
-
-    payload = request.get_json(silent=True) or {}
+@app.post("/batch-quotes")
+async def batch_quotes(request: Request):
+    payload = await request.json()
     identifiers = payload.get("identifiers", [])
     if not identifiers:
-        return jsonify({"status": "error", "message": "Keine Identifiers angegeben"}), 400
+        raise HTTPException(status_code=400, detail="Keine Identifiers angegeben")
 
     results = {}
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -198,26 +194,23 @@ def batch_quotes():
             ident, res = f.result()
             results[ident] = res
 
-    return jsonify({
+    return {
         "status": "ok",
         "count": len(results),
         "data": results
-    }), 200
+    }
 
-@app.route("/quote-deep", methods=["GET"])
-def quote_deep():
-    """Detailabfrage inkl. Stammdaten und Lookthrough-Breakdown"""
-    query = request.args.get("query", "").strip().upper()
-    if not query:
-        return jsonify({"status": "error", "message": "Keine Query angegeben"}), 400
+@app.get("/quote-deep")
+def quote_deep(query: str = ""):
+    clean = query.strip().upper()
+    if not clean:
+        raise HTTPException(status_code=400, detail="Keine Query angegeben")
 
-    # 1. Look-Through Datenbank prüfen
-    if query in LOOKTHROUGH_DATABASE:
-        base = LOOKTHROUGH_DATABASE[query]
-        # Kurs via yfinance nachladen
-        _, quote_res = fetch_single_quote(query)
+    if clean in LOOKTHROUGH_DATABASE:
+        base = LOOKTHROUGH_DATABASE[clean]
+        _, quote_res = fetch_single_quote(clean)
         price = quote_res.get("price") if quote_res.get("status") == "success" else None
-        return jsonify({
+        return {
             "status": "success",
             "name": base["name"],
             "type": base["type"],
@@ -226,18 +219,17 @@ def quote_deep():
             "sector": base["sector"],
             "price": price,
             "breakdown": base.get("breakdown")
-        }), 200
+        }
 
-    # 2. Regulärer yfinance Lookup
     try:
-        t = yf.Ticker(query)
+        t = yf.Ticker(clean)
         info = t.info or {}
         fast = t.fast_info
 
-        name = info.get("shortName") or info.get("longName") or query
-        cur = getattr(fast, "currency", None) or info.get("currency") or ("EUR" if query.endswith(".DE") else "USD")
+        name = info.get("shortName") or info.get("longName") or clean
+        cur = getattr(fast, "currency", None) or info.get("currency") or ("EUR" if clean.endswith(".DE") else "USD")
         price = getattr(fast, "last_price", None) or getattr(fast, "regular_market_price", None) or info.get("currentPrice")
-        
+
         country = info.get("country", "Global")
         if country in ["United States", "US"]:
             country = "USA"
@@ -246,7 +238,7 @@ def quote_deep():
 
         sector = info.get("sector", "Technologie")
 
-        return jsonify({
+        return {
             "status": "success",
             "name": name,
             "type": "Aktie" if not info.get("quoteType") == "ETF" else "ETF",
@@ -254,11 +246,7 @@ def quote_deep():
             "currency": cur,
             "sector": sector,
             "price": round(float(price), 2) if price else None
-        }), 200
+        }
     except Exception as e:
-        logger.warning("Quote-deep fehlgeschlagen fuer %s: %s", query, e)
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+        logger.warning("Quote-deep fehlgeschlagen fuer %s: %s", clean, e)
+        raise HTTPException(status_code=500, detail=str(e))
