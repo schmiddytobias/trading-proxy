@@ -1,339 +1,264 @@
-import concurrent.futures
-from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import requests
+import os
+import json
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import yfinance as yf
 
-app = FastAPI(title="Bloomberg Terminal Market Proxy", version="2.3")
+# Logging Setup
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("trading-proxy")
 
-# 1. CORS VOLLSTÄNDIG FREISCHALTEN (Erlaubt Zugriffe von Netlify & Browser)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = Flask(__name__)
+# Enable CORS for all routes and origins (allowing requests from your terminal)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+PORTFOLIO_FILE = os.path.join(os.path.dirname(__file__), "portfolio_store.json")
+
+# Look-through Datenbank für Fonds / ETFs
+LOOKTHROUGH_DATABASE = {
+    "DE0008474503": {
+        "name": "Deka-Technologie CF",
+        "type": "Fonds",
+        "country": "USA",
+        "currency": "EUR",
+        "sector": "Technologie",
+        "breakdown": {
+            "countries": {"USA": 84.5, "Taiwan": 6.2, "Niederlande": 4.1, "Sonstige": 5.2},
+            "sectors": {"Halbleiter & KI": 48.0, "Software & Cloud": 32.5, "Hardware": 14.5, "Liquidität": 5.0},
+            "currencies": {"USD": 88.0, "EUR": 8.0, "Sonstige": 4.0}
+        }
+    },
+    "847450": {
+        "name": "Deka-Technologie CF",
+        "type": "Fonds",
+        "country": "USA",
+        "currency": "EUR",
+        "sector": "Technologie",
+        "breakdown": {
+            "countries": {"USA": 84.5, "Taiwan": 6.2, "Niederlande": 4.1, "Sonstige": 5.2},
+            "sectors": {"Halbleiter & KI": 48.0, "Software & Cloud": 32.5, "Hardware": 14.5, "Liquidität": 5.0},
+            "currencies": {"USD": 88.0, "EUR": 8.0, "Sonstige": 4.0}
+        }
+    },
+    "IE00B3RBWM25": {
+        "name": "Vanguard FTSE All-World UCITS ETF (Dist)",
+        "type": "ETF",
+        "country": "Global",
+        "currency": "EUR",
+        "sector": "Breit gestreut (Welt)",
+        "breakdown": {
+            "countries": {"USA": 62.0, "Japan": 6.1, "UK": 3.8, "Frankreich": 2.8, "Deutschland": 2.1, "Sonstige": 23.2},
+            "sectors": {"Technologie": 26.5, "Finanzen": 15.2, "Gesundheit": 11.4, "Industrie": 10.8, "Konsum": 12.1, "Sonstige": 24.0},
+            "currencies": {"USD": 63.5, "EUR": 10.2, "JPY": 6.1, "GBP": 3.8, "Sonstige": 16.4}
+        }
+    },
+    "A1JX52": {
+        "name": "Vanguard FTSE All-World UCITS ETF (Dist)",
+        "type": "ETF",
+        "country": "Global",
+        "currency": "EUR",
+        "sector": "Breit gestreut (Welt)",
+        "breakdown": {
+            "countries": {"USA": 62.0, "Japan": 6.1, "UK": 3.8, "Frankreich": 2.8, "Deutschland": 2.1, "Sonstige": 23.2},
+            "sectors": {"Technologie": 26.5, "Finanzen": 15.2, "Gesundheit": 11.4, "Industrie": 10.8, "Konsum": 12.1, "Sonstige": 24.0},
+            "currencies": {"USD": 63.5, "EUR": 10.2, "JPY": 6.1, "GBP": 3.8, "Sonstige": 16.4}
+        }
+    },
+    "IE00BK5BQT80": {
+        "name": "Vanguard FTSE All-World UCITS ETF (Acc)",
+        "type": "ETF",
+        "country": "Global",
+        "currency": "EUR",
+        "sector": "Breit gestreut (Welt)",
+        "breakdown": {
+            "countries": {"USA": 62.0, "Japan": 6.1, "UK": 3.8, "Frankreich": 2.8, "Deutschland": 2.1, "Sonstige": 23.2},
+            "sectors": {"Technologie": 26.5, "Finanzen": 15.2, "Gesundheit": 11.4, "Industrie": 10.8, "Konsum": 12.1, "Sonstige": 24.0},
+            "currencies": {"USD": 63.5, "EUR": 10.2, "JPY": 6.1, "GBP": 3.8, "Sonstige": 16.4}
+        }
+    },
+    "A2PKXG": {
+        "name": "Vanguard FTSE All-World UCITS ETF (Acc)",
+        "type": "ETF",
+        "country": "Global",
+        "currency": "EUR",
+        "sector": "Breit gestreut (Welt)",
+        "breakdown": {
+            "countries": {"USA": 62.0, "Japan": 6.1, "UK": 3.8, "Frankreich": 2.8, "Deutschland": 2.1, "Sonstige": 23.2},
+            "sectors": {"Technologie": 26.5, "Finanzen": 15.2, "Gesundheit": 11.4, "Industrie": 10.8, "Konsum": 12.1, "Sonstige": 24.0},
+            "currencies": {"USD": 63.5, "EUR": 10.2, "JPY": 6.1, "GBP": 3.8, "Sonstige": 16.4}
+        }
+    }
 }
 
-
-class BatchRequest(BaseModel):
-    identifiers: List[str]
-
-
-# ================= INTELLIGENTES MAPPING (LAND & BRANCHE) =================
-
-def map_country(country_str: Optional[str], identifier: str = "") -> str:
-    clean_id = identifier.strip().upper()
-
-    # 1. Höchste Priorität: ISIN-Ländercode oder Ticker-Suffix
-    if clean_id.startswith("US") or ("." not in clean_id and len(clean_id) <= 5 and not clean_id.isdigit()):
-        return "USA"
-    if clean_id.startswith("DE") or clean_id.endswith(".DE") or clean_id.endswith(".F"):
-        return "Deutschland"
-    if clean_id.startswith("CH") or clean_id.endswith(".SW"):
-        return "Europa (ex DE)"
-    if clean_id.startswith("FR") or clean_id.endswith(".PA"):
-        return "Europa (ex DE)"
-    if clean_id.startswith("GB") or clean_id.endswith(".L"):
-        return "Europa (ex DE)"
-    if clean_id.startswith("NL") or clean_id.endswith(".AS"):
-        return "Europa (ex DE)"
-
-    if not country_str:
-        return "Global"
-
-    c = country_str.lower()
-    if any(k in c for k in ["united states", "usa", "us"]):
-        return "USA"
-    if any(k in c for k in ["germany", "deutschland", "de"]):
-        return "Deutschland"
-    if any(k in c for k in ["france", "netherlands", "switzerland", "united kingdom", "britain", "italy", "spain", "sweden", "denmark", "ireland", "austria", "belgium"]):
-        return "Europa (ex DE)"
-    if any(k in c for k in ["china", "japan", "taiwan", "korea", "india", "hong kong", "singapore"]):
-        return "Asien / EM"
-
-    return "Sonstige"
-
-
-def map_sector(sector_str: Optional[str], name_str: str = "", industry_str: Optional[str] = "") -> str:
-    combined = f"{sector_str or ''} {name_str or ''} {industry_str or ''}".lower()
-
-    # Technologie (inkl. Google/Alphabet, Meta, Software, Halbleiter, Internet)
-    if any(k in combined for k in [
-        "tech", "software", "semiconductor", "it", "internet", 
-        "communication", "interactive media", "google", "alphabet", 
-        "microsoft", "apple", "nvidia", "sap"
-    ]):
-        return "Technologie"
-
-    # Industrie / Rüstung
-    if any(k in combined for k in [
-        "industr", "aerospace", "defen", "machin", "rheinmetall", 
-        "hensoldt", "lockheed", "airbus", "siemens"
-    ]):
-        return "Industrie / Rüstung"
-
-    # Finanzen & Banken
-    if any(k in combined for k in ["financ", "bank", "insur", "allianz", "münchener rück", "jpmorgan", "visa"]):
-        return "Finanzen"
-
-    # Gesundheit / Pharma
-    if any(k in combined for k in ["health", "pharma", "biotech", "medical"]):
-        return "Gesundheit"
-
-    # Konsumgüter & Einzelhandel
-    if any(k in combined for k in ["consum", "retail", "amazon", "beiersdorf", "nestle"]):
-        return "Konsumgüter"
-
-    # Energie, Öl & Rohstoffe
-    if any(k in combined for k in ["energy", "oil", "gas", "basic materials", "mining", "commod"]):
-        return "Energie & Rohstoffe"
-
-    # Reine Telekommunikationsnetze
-    if any(k in combined for k in ["telecom", "telekommunikation", "telefónica", "deutsche telekom"]):
-        return "Telekommunikation"
-
-    return "Sonstige"
-
-
-# ================= BASIS-KURSABFRAGE =================
-
-def resolve_single_security(identifier: str) -> Dict[str, Any]:
-    """
-    Sucht ein Wertpapier über Yahoo Finance (Aktien/ETFs)
-    und fällt bei KAG-Publikumsfonds auf Onvista zurück.
-    """
-    clean_id = identifier.strip().upper()
-    if not clean_id:
-        return {"id": identifier, "status": "error", "message": "Leere Kennnummer"}
-
-    # STUFE 1: Yahoo Finance Query
-    try:
-        y_search_url = f"https://query1.finance.yahoo.com/v1/finance/search?q={clean_id}&quotesCount=5&newsCount=0"
-        y_res = requests.get(y_search_url, headers=HEADERS, timeout=4).json()
-        quotes = y_res.get("quotes", [])
-
-        if quotes:
-            best_match = quotes[0]
-            ticker = best_match.get("symbol")
-
-            chart_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1d"
-            c_res = requests.get(chart_url, headers=HEADERS, timeout=4).json()
-            meta = c_res["chart"]["result"][0]["meta"]
-
-            price = meta.get("regularMarketPrice")
-            if price is not None:
-                currency = meta.get("currency", "EUR")
-                prev_close = meta.get("chartPreviousClose", price)
-                change_pct = round(((price - prev_close) / prev_close) * 100, 2) if prev_close else 0.0
-
-                raw_type = best_match.get("quoteType", "EQUITY")
-                inst_type = "ETF" if raw_type == "ETF" else ("Fonds" if raw_type == "MUTUALFUND" else "Aktie")
-
-                return {
-                    "id": clean_id,
-                    "status": "success",
-                    "source": "YahooFinance",
-                    "symbol": ticker,
-                    "name": meta.get("shortName") or best_match.get("longname") or best_match.get("shortname") or clean_id,
-                    "type": inst_type,
-                    "price": round(float(price), 2),
-                    "currency": currency,
-                    "previousClose": round(float(prev_close), 2),
-                    "changePct": change_pct
-                }
-    except Exception:
-        pass
-
-    # STUFE 2: Onvista Snapshot Fallback (Deka, DWS, Flossbach etc.)
-    try:
-        ov_search_url = f"https://api.onvista.de/api/v1/instruments/query?searchValue={clean_id}"
-        ov_res = requests.get(ov_search_url, headers=HEADERS, timeout=4).json()
-        instruments = ov_res.get("list", [])
-
-        if instruments:
-            item = instruments[0]
-            entity_type = item.get("entityType", "").lower()
-            entity_id = item.get("entityValue")
-
-            snap_url = f"https://api.onvista.de/api/v1/{entity_type}s/{entity_id}/snapshot"
-            snap_res = requests.get(snap_url, headers=HEADERS, timeout=4).json()
-            quote_data = snap_res.get("quote", {})
-
-            nav_price = quote_data.get("last") or quote_data.get("nav")
-            if nav_price is not None:
-                prev = quote_data.get("close", nav_price)
-                change_pct = round(((nav_price - prev) / prev) * 100, 2) if prev else 0.0
-
-                return {
-                    "id": clean_id,
-                    "status": "success",
-                    "source": "Onvista",
-                    "symbol": item.get("wkn") or clean_id,
-                    "name": item.get("name") or clean_id,
-                    "type": "Fonds",
-                    "price": round(float(nav_price), 2),
-                    "currency": quote_data.get("currency", "EUR"),
-                    "previousClose": round(float(prev), 2),
-                    "changePct": change_pct
-                }
-    except Exception:
-        pass
-
-    return {
-        "id": clean_id,
-        "status": "not_found",
-        "message": "Wertpapier konnte nicht ermittelt werden."
-    }
-
-
-# ================= TIEFEN-STAMMDATEN & DURCHSCHAU (DEEP LOOKUP) =================
-
-def resolve_deep_security(identifier: str) -> Dict[str, Any]:
-    """
-    Ermittelt für Aktien: Typ, Währung, Land und Branche.
-    Ermittelt für Fonds/ETFs: Look-Through Gewichtungen (Länder, Branchen, Währungen).
-    """
-    base = resolve_single_security(identifier)
-    clean_id = identifier.strip().upper()
-
-    ticker_sym = base.get("symbol") or clean_id
-
-    info = {}
-    try:
-        t = yf.Ticker(ticker_sym)
-        info = t.info or {}
-    except Exception:
-        pass
-
-    # Typ absichern
-    q_type = info.get("quoteType", "").upper()
-    if not q_type:
-        q_type = "ETF" if base.get("type") == "ETF" else ("MUTUALFUND" if base.get("type") == "Fonds" else "EQUITY")
-
-    if q_type == "ETF":
-        sec_type = "ETF"
-    elif q_type in ["MUTUALFUND", "FONDS"]:
-        sec_type = "Fonds"
-    else:
-        sec_type = "Aktie"
-
-    base["type"] = sec_type
-
-    if sec_type == "Aktie":
-        raw_country = info.get("country")
-        raw_sector = info.get("sector")
-        raw_industry = info.get("industry")
-
-        # Priorisiertes Mapping mit ISIN/Ticker-Abgleich
-        base["country"] = map_country(raw_country, clean_id if clean_id.startswith("US") or clean_id.startswith("DE") else ticker_sym)
-        base["sector"] = map_sector(raw_sector, base.get("name", ""), raw_industry)
-        base["currency"] = info.get("currency") or base.get("currency", "EUR")
-
-    else:
-        # FONDS / ETF: Multi-Asset Durchschau (Look-Through)
-        base["country"] = "Global"
-        base["sector"] = "Breit gestreut (Welt)"
-        base["currency"] = info.get("currency") or base.get("currency", "USD")
-
-        # 1. Sektoren auslesen
-        sectors = {}
-        if "sectorWeightings" in info and isinstance(info["sectorWeightings"], list):
-            for item in info["sectorWeightings"]:
-                for s_name, weight in item.items():
-                    norm_sec = map_sector(s_name)
-                    sectors[norm_sec] = sectors.get(norm_sec, 0) + round(float(weight) * 100, 1)
-
-        if not sectors:
-            sectors = {
-                "Technologie": 26.5,
-                "Finanzen": 15.2,
-                "Industrie / Rüstung": 11.5,
-                "Gesundheit": 10.8,
-                "Konsumgüter": 12.0,
-                "Sonstige": 24.0
-            }
-
-        # 2. Länder auslesen
-        countries = {
-            "USA": 63.5,
-            "Europa (ex DE)": 14.5,
-            "Deutschland": 2.5,
-            "Asien / EM": 13.5,
-            "Sonstige": 6.0
-        }
-
-        # 3. Währungen auslesen
-        fnd_cur = base["currency"]
-        currencies = {
-            fnd_cur: 65.0,
-            ("EUR" if fnd_cur != "EUR" else "USD"): 25.0,
-            "Sonstige": 10.0
-        }
-
-        base["breakdown"] = {
-            "sectors": sectors,
-            "countries": countries,
-            "currencies": currencies
-        }
-
-    return base
-
-
-# ================= ROUTEN =================
-
-# HEALTH-CHECK ROOT ROUTE (Behebt den "Not Found" / 404 Fehler)
-@app.get("/")
+@app.route("/", methods=["GET"])
 def health_check():
-    return {
-        "status": "ok",
-        "service": "Bloomberg Market Proxy v2.3"
-    }
+    """Health-Check Route für Render und Terminal-Status"""
+    return jsonify({
+        "status": "online",
+        "service": "Bloomberg Terminal Proxy & Cloud Engine",
+        "version": "3.0"
+    }), 200
 
+# ==========================================
+# CLOUD SYNCHRONISATION (PORTFOLIO & SPARPLÄNE)
+# ==========================================
 
-@app.get("/quote")
-def get_single_quote(query: str):
-    result = resolve_single_security(query)
-    if result.get("status") != "success":
-        raise HTTPException(status_code=404, detail=result.get("message"))
-    return result
+@app.route("/save-portfolio", methods=["POST", "OPTIONS"])
+def save_portfolio():
+    """Speichert das Depot persistent auf dem Render-Server"""
+    if request.method == "OPTIONS":
+        return "", 200
+    try:
+        data = request.get_json(silent=True) or {}
+        with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        logger.info("Depot erfolgreich in Cloud gespeichert (%d Positionen).", len(data.get("holdings", [])))
+        return jsonify({"status": "success", "message": "Portfolio in Cloud gespeichert"}), 200
+    except Exception as e:
+        logger.error("Fehler beim Speichern des Depots: %s", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
 
+@app.route("/load-portfolio", methods=["GET"])
+def load_portfolio():
+    """Lädt das persistent gespeicherte Depot für Desktop & Smartphone"""
+    try:
+        if os.path.exists(PORTFOLIO_FILE):
+            with open(PORTFOLIO_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return jsonify(data), 200
+        return jsonify({"holdings": [], "sparplaene": []}), 200
+    except Exception as e:
+        logger.error("Fehler beim Laden des Depots: %s", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.get("/quote-deep")
-def get_quote_deep(query: str):
-    """Gibt Typ, Land, Branche, Währung & Fonds-Durchschau zurück."""
-    result = resolve_deep_security(query)
-    return result
+# ==========================================
+# KURSABFRAGEN & BATCH-QUOTES
+# ==========================================
 
+def fetch_single_quote(identifier):
+    """Holt Kursdaten für einen einzelnen Ticker/ISIN via yfinance"""
+    clean_id = identifier.strip().upper()
+    try:
+        ticker = yf.Ticker(clean_id)
+        # Schnelle Abfrage über 1d history
+        hist = ticker.history(period="2d")
+        if hist.empty:
+            info = ticker.fast_info
+            price = getattr(info, "last_price", None) or getattr(info, "regular_market_price", None)
+            prev = getattr(info, "previous_close", None) or price
+            cur = getattr(info, "currency", "EUR" if clean_id.endswith(".DE") else "USD")
+            chg = (((price - prev) / prev) * 100) if prev and price else 0.0
+            if price:
+                return clean_id, {
+                    "status": "success",
+                    "price": round(float(price), 2),
+                    "changePct": round(float(chg), 2),
+                    "currency": cur
+                }
+            return clean_id, {"status": "not_found"}
 
-@app.post("/batch-quotes")
-def get_batch_quotes(payload: BatchRequest):
-    unique_ids = list(set([i.strip().upper() for i in payload.identifiers if i.strip()]))
+        current_price = float(hist["Close"].iloc[-1])
+        prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else current_price
+        chg_pct = ((current_price - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
+        
+        # Währungsermittlung
+        cur = "EUR" if clean_id.endswith(".DE") else "USD"
+        try:
+            cur = ticker.fast_info.currency or cur
+        except Exception:
+            pass
+
+        return clean_id, {
+            "status": "success",
+            "price": round(current_price, 2),
+            "changePct": round(chg_pct, 2),
+            "currency": cur
+        }
+    except Exception as ex:
+        logger.warning("Fehler bei Quote fuer %s: %s", clean_id, ex)
+        return clean_id, {"status": "error", "message": str(ex)}
+
+@app.route("/batch-quotes", methods=["POST", "OPTIONS"])
+def batch_quotes():
+    """Parallele Kursaktualisierung für mehrere Positionen"""
+    if request.method == "OPTIONS":
+        return "", 200
+
+    payload = request.get_json(silent=True) or {}
+    identifiers = payload.get("identifiers", [])
+    if not identifiers:
+        return jsonify({"status": "error", "message": "Keine Identifiers angegeben"}), 400
+
     results = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(fetch_single_quote, ident) for ident in identifiers]
+        for f in futures:
+            ident, res = f.result()
+            results[ident] = res
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        future_to_id = {executor.submit(resolve_single_security, uid): uid for uid in unique_ids}
-        for future in concurrent.futures.as_completed(future_to_id):
-            uid = future_to_id[future]
-            try:
-                results[uid] = future.result()
-            except Exception as e:
-                results[uid] = {"id": uid, "status": "error", "message": str(e)}
-
-    return {
+    return jsonify({
+        "status": "ok",
         "count": len(results),
         "data": results
-    }
+    }), 200
 
+@app.route("/quote-deep", methods=["GET"])
+def quote_deep():
+    """Detailabfrage inkl. Stammdaten und Lookthrough-Breakdown"""
+    query = request.args.get("query", "").strip().upper()
+    if not query:
+        return jsonify({"status": "error", "message": "Keine Query angegeben"}), 400
+
+    # 1. Look-Through Datenbank prüfen
+    if query in LOOKTHROUGH_DATABASE:
+        base = LOOKTHROUGH_DATABASE[query]
+        # Kurs via yfinance nachladen
+        _, quote_res = fetch_single_quote(query)
+        price = quote_res.get("price") if quote_res.get("status") == "success" else None
+        return jsonify({
+            "status": "success",
+            "name": base["name"],
+            "type": base["type"],
+            "country": base["country"],
+            "currency": base["currency"],
+            "sector": base["sector"],
+            "price": price,
+            "breakdown": base.get("breakdown")
+        }), 200
+
+    # 2. Regulärer yfinance Lookup
+    try:
+        t = yf.Ticker(query)
+        info = t.info or {}
+        fast = t.fast_info
+
+        name = info.get("shortName") or info.get("longName") or query
+        cur = getattr(fast, "currency", None) or info.get("currency") or ("EUR" if query.endswith(".DE") else "USD")
+        price = getattr(fast, "last_price", None) or getattr(fast, "regular_market_price", None) or info.get("currentPrice")
+        
+        country = info.get("country", "Global")
+        if country in ["United States", "US"]:
+            country = "USA"
+        elif country in ["Germany"]:
+            country = "Deutschland"
+
+        sector = info.get("sector", "Technologie")
+
+        return jsonify({
+            "status": "success",
+            "name": name,
+            "type": "Aktie" if not info.get("quoteType") == "ETF" else "ETF",
+            "country": country,
+            "currency": cur,
+            "sector": sector,
+            "price": round(float(price), 2) if price else None
+        }), 200
+    except Exception as e:
+        logger.warning("Quote-deep fehlgeschlagen fuer %s: %s", query, e)
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
-    import uvicorn
-    import os
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
