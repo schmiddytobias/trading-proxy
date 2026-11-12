@@ -1,4 +1,5 @@
 import os
+import io
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -7,10 +8,14 @@ from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
 import requests
 
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("market-proxy")
 
-app = FastAPI(title="Bloomberg Terminal Proxy & Cloud Engine", version="3.0")
+app = FastAPI(title="Bloomberg Terminal Proxy & Cloud Engine", version="3.1-GDrive")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,7 +25,85 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Lokaler Fallback-Pfad + Google Drive Konfiguration
 PORTFOLIO_FILE = os.path.join(os.path.dirname(__file__), "portfolio_store.json")
+DRIVE_FILENAME = "portfolio_store.json"
+DEFAULT_GDRIVE_FOLDER_ID = "1Ty79vWzXZFJXU0MBakNoVyoFW3SVTef_"
+
+def get_gdrive_service():
+    """Erstellt den Google Drive API Client aus der Render-Umgebungsvariable."""
+    sa_json_str = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON", "").strip()
+    if not sa_json_str:
+        logger.warning("GDRIVE_SERVICE_ACCOUNT_JSON ist nicht gesetzt – nutze lokalen Fallback.")
+        return None
+    try:
+        sa_info = json.loads(sa_json_str)
+        creds = service_account.Credentials.from_service_account_info(
+            sa_info,
+            scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception as e:
+        logger.error("Fehler beim Initialisieren des Google Drive Clients: %s", e)
+        return None
+
+def find_drive_file_id(service, folder_id: str) -> str | None:
+    """Sucht nach portfolio_store.json im freigegebenen Google Drive Ordner."""
+    query = f"name = '{DRIVE_FILENAME}' and '{folder_id}' in parents and trashed = false"
+    results = service.files().list(
+        q=query,
+        spaces="drive",
+        fields="files(id, name)",
+        pageSize=1
+    ).execute()
+    files = results.get("files", [])
+    return files[0]["id"] if files else None
+
+def save_to_gdrive(data: dict) -> bool:
+    """Speichert oder aktualisiert portfolio_store.json in Google Drive."""
+    service = get_gdrive_service()
+    if not service:
+        return False
+
+    folder_id = os.environ.get("GDRIVE_FOLDER_ID", DEFAULT_GDRIVE_FOLDER_ID).strip()
+    json_bytes = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    media = MediaIoBaseUpload(io.BytesIO(json_bytes), mimetype="application/json", resumable=False)
+
+    existing_file_id = find_drive_file_id(service, folder_id)
+    if existing_file_id:
+        service.files().update(fileId=existing_file_id, media_body=media).execute()
+        logger.info("Google Drive Datei aktualisiert (ID: %s).", existing_file_id)
+    else:
+        file_metadata = {
+            "name": DRIVE_FILENAME,
+            "parents": [folder_id]
+        }
+        created = service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+        logger.info("Neue Google Drive Datei angelegt (ID: %s).", created.get("id"))
+    return True
+
+def load_from_gdrive() -> dict | None:
+    """Lädt portfolio_store.json aus Google Drive."""
+    service = get_gdrive_service()
+    if not service:
+        return None
+
+    folder_id = os.environ.get("GDRIVE_FOLDER_ID", DEFAULT_GDRIVE_FOLDER_ID).strip()
+    existing_file_id = find_drive_file_id(service, folder_id)
+    if not existing_file_id:
+        logger.info("Noch keine portfolio_store.json in Google Drive vorhanden.")
+        return {"holdings": [], "sparplaene": []}
+
+    request_drive = service.files().get_media(fileId=existing_file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request_drive)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+
+    fh.seek(0)
+    content = fh.read().decode("utf-8")
+    return json.loads(content)
 
 LOOKTHROUGH_DATABASE = {
     "DE0008474503": {
@@ -59,17 +142,31 @@ LOOKTHROUGH_DATABASE = {
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "service": "Bloomberg Terminal Proxy & Cloud Engine", "version": "3.0"}
+    gdrive_configured = bool(os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON", "").strip())
+    return {
+        "status": "online",
+        "service": "Bloomberg Terminal Proxy & Cloud Engine",
+        "version": "3.1-GDrive",
+        "gdrive_connected": gdrive_configured
+    }
 
-# CLOUD SYNCHRONISATION
+# CLOUD SYNCHRONISATION MIT GOOGLE DRIVE
 @app.post("/save-portfolio")
 async def save_portfolio(request: Request):
     try:
         data = await request.json()
+        # 1. Lokal als Cache sichern
         with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        logger.info("Depot in Cloud gespeichert (%d Positionen).", len(data.get("holdings", [])))
-        return {"status": "success", "message": "Portfolio in Cloud gespeichert"}
+
+        # 2. Dauerhaft in Google Drive speichern
+        gdrive_ok = save_to_gdrive(data)
+        logger.info("Depot gespeichert (%d Positionen, Google Drive: %s).", len(data.get("holdings", [])), gdrive_ok)
+        return {
+            "status": "success",
+            "storage": "google_drive" if gdrive_ok else "local_fallback",
+            "message": "Portfolio dauerhaft in Google Drive gespeichert" if gdrive_ok else "Lokal gespeichert (Drive-Key fehlt)"
+        }
     except Exception as e:
         logger.error("Fehler beim Speichern des Depots: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -77,6 +174,15 @@ async def save_portfolio(request: Request):
 @app.get("/load-portfolio")
 def load_portfolio():
     try:
+        # 1. Primär aus Google Drive laden
+        drive_data = load_from_gdrive()
+        if drive_data is not None:
+            # Lokalen Cache aktualisieren
+            with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
+                json.dump(drive_data, f, ensure_ascii=False, indent=2)
+            return drive_data
+
+        # 2. Fallback auf lokale Datei
         if os.path.exists(PORTFOLIO_FILE):
             with open(PORTFOLIO_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
@@ -207,3 +313,4 @@ def quote_deep(query: str = ""):
     except Exception as e:
         logger.warning("Quote-deep Fehler für %s: %s", clean, e)
         raise HTTPException(status_code=500, detail=str(e))
+ 
