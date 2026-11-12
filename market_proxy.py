@@ -1,6 +1,8 @@
 import os
 import io
+import re
 import json
+import time
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, Request, HTTPException
@@ -15,7 +17,7 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("market-proxy")
 
-app = FastAPI(title="Market Desk Proxy & Cloud Engine", version="3.2-Tradegate-GDrive")
+app = FastAPI(title="Market Desk Proxy & Cloud Engine", version="3.3-LS-LiveFX-GDrive")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,75 +27,74 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Lokaler Fallback-Pfad + Google Drive Konfiguration
 PORTFOLIO_FILE = os.path.join(os.path.dirname(__file__), "portfolio_store.json")
 DRIVE_FILENAME = "portfolio_store.json"
 DEFAULT_GDRIVE_FOLDER_ID = "1Ty79vWzXZFJXU0MBakNoVyoFW3SVTef_"
 
-# Stammdaten-Mapping: WKN / Ticker / Alias -> ISIN + Offizieller Name + Yahoo-Fallback
+# Stammdaten-Mapping: ISIN, Name, US/Heimat-Ticker (für Live-Kurs bis 22 Uhr) & DE-Ticker
 SECURITY_MASTER_DB = {
-    "NVDA": {"isin": "US67066G1040", "name": "NVIDIA Corp.", "yahoo": "NVD.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
-    "918422": {"isin": "US67066G1040", "name": "NVIDIA Corp.", "yahoo": "NVD.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
-    "US67066G1040": {"isin": "US67066G1040", "name": "NVIDIA Corp.", "yahoo": "NVD.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
-    "NVD.DE": {"isin": "US67066G1040", "name": "NVIDIA Corp.", "yahoo": "NVD.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "NVDA": {"isin": "US67066G1040", "name": "NVIDIA Corp.", "yahoo": "NVDA", "de_ticker": "NVD.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "918422": {"isin": "US67066G1040", "name": "NVIDIA Corp.", "yahoo": "NVDA", "de_ticker": "NVD.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "US67066G1040": {"isin": "US67066G1040", "name": "NVIDIA Corp.", "yahoo": "NVDA", "de_ticker": "NVD.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "NVD.DE": {"isin": "US67066G1040", "name": "NVIDIA Corp.", "yahoo": "NVDA", "de_ticker": "NVD.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
 
-    "GOOGL": {"isin": "US02079K3059", "name": "Alphabet Inc. (Class A)", "yahoo": "ABEC.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
-    "A14Y6F": {"isin": "US02079K3059", "name": "Alphabet Inc. (Class A)", "yahoo": "ABEC.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
-    "US02079K3059": {"isin": "US02079K3059", "name": "Alphabet Inc. (Class A)", "yahoo": "ABEC.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
-    "ABEC.DE": {"isin": "US02079K3059", "name": "Alphabet Inc. (Class A)", "yahoo": "ABEC.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "GOOGL": {"isin": "US02079K3059", "name": "Alphabet Inc. (Class A)", "yahoo": "GOOGL", "de_ticker": "ABEC.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "A14Y6F": {"isin": "US02079K3059", "name": "Alphabet Inc. (Class A)", "yahoo": "GOOGL", "de_ticker": "ABEC.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "US02079K3059": {"isin": "US02079K3059", "name": "Alphabet Inc. (Class A)", "yahoo": "GOOGL", "de_ticker": "ABEC.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "ABEC.DE": {"isin": "US02079K3059", "name": "Alphabet Inc. (Class A)", "yahoo": "GOOGL", "de_ticker": "ABEC.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
 
-    "RHM.DE": {"isin": "DE0007030009", "name": "Rheinmetall AG", "yahoo": "RHM.DE", "country": "Deutschland", "sector": "Industrie / Rüstung", "type": "Aktie"},
-    "RHM": {"isin": "DE0007030009", "name": "Rheinmetall AG", "yahoo": "RHM.DE", "country": "Deutschland", "sector": "Industrie / Rüstung", "type": "Aktie"},
-    "703000": {"isin": "DE0007030009", "name": "Rheinmetall AG", "yahoo": "RHM.DE", "country": "Deutschland", "sector": "Industrie / Rüstung", "type": "Aktie"},
-    "DE0007030009": {"isin": "DE0007030009", "name": "Rheinmetall AG", "yahoo": "RHM.DE", "country": "Deutschland", "sector": "Industrie / Rüstung", "type": "Aktie"},
+    "RHM.DE": {"isin": "DE0007030009", "name": "Rheinmetall AG", "yahoo": "RHM.DE", "de_ticker": "RHM.DE", "country": "Deutschland", "sector": "Industrie / Rüstung", "type": "Aktie"},
+    "RHM": {"isin": "DE0007030009", "name": "Rheinmetall AG", "yahoo": "RHM.DE", "de_ticker": "RHM.DE", "country": "Deutschland", "sector": "Industrie / Rüstung", "type": "Aktie"},
+    "703000": {"isin": "DE0007030009", "name": "Rheinmetall AG", "yahoo": "RHM.DE", "de_ticker": "RHM.DE", "country": "Deutschland", "sector": "Industrie / Rüstung", "type": "Aktie"},
+    "DE0007030009": {"isin": "DE0007030009", "name": "Rheinmetall AG", "yahoo": "RHM.DE", "de_ticker": "RHM.DE", "country": "Deutschland", "sector": "Industrie / Rüstung", "type": "Aktie"},
 
-    "SAP.DE": {"isin": "DE0007164600", "name": "SAP SE", "yahoo": "SAP.DE", "country": "Deutschland", "sector": "Technologie", "type": "Aktie"},
-    "SAP": {"isin": "DE0007164600", "name": "SAP SE", "yahoo": "SAP.DE", "country": "Deutschland", "sector": "Technologie", "type": "Aktie"},
-    "716460": {"isin": "DE0007164600", "name": "SAP SE", "yahoo": "SAP.DE", "country": "Deutschland", "sector": "Technologie", "type": "Aktie"},
-    "DE0007164600": {"isin": "DE0007164600", "name": "SAP SE", "yahoo": "SAP.DE", "country": "Deutschland", "sector": "Technologie", "type": "Aktie"},
+    "SAP.DE": {"isin": "DE0007164600", "name": "SAP SE", "yahoo": "SAP.DE", "de_ticker": "SAP.DE", "country": "Deutschland", "sector": "Technologie", "type": "Aktie"},
+    "SAP": {"isin": "DE0007164600", "name": "SAP SE", "yahoo": "SAP.DE", "de_ticker": "SAP.DE", "country": "Deutschland", "sector": "Technologie", "type": "Aktie"},
+    "716460": {"isin": "DE0007164600", "name": "SAP SE", "yahoo": "SAP.DE", "de_ticker": "SAP.DE", "country": "Deutschland", "sector": "Technologie", "type": "Aktie"},
+    "DE0007164600": {"isin": "DE0007164600", "name": "SAP SE", "yahoo": "SAP.DE", "de_ticker": "SAP.DE", "country": "Deutschland", "sector": "Technologie", "type": "Aktie"},
 
-    "PLTR": {"isin": "US69608A1088", "name": "Palantir Technologies Inc.", "yahoo": "PTX.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
-    "A2QA4J": {"isin": "US69608A1088", "name": "Palantir Technologies Inc.", "yahoo": "PTX.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
-    "US69608A1088": {"isin": "US69608A1088", "name": "Palantir Technologies Inc.", "yahoo": "PTX.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "PLTR": {"isin": "US69608A1088", "name": "Palantir Technologies Inc.", "yahoo": "PLTR", "de_ticker": "PTX.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "A2QA4J": {"isin": "US69608A1088", "name": "Palantir Technologies Inc.", "yahoo": "PLTR", "de_ticker": "PTX.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "US69608A1088": {"isin": "US69608A1088", "name": "Palantir Technologies Inc.", "yahoo": "PLTR", "de_ticker": "PTX.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
 
-    "ASML": {"isin": "NL0010273215", "name": "ASML Holding N.V.", "yahoo": "ASME.DE", "country": "Europa (ex DE)", "sector": "Technologie", "type": "Aktie"},
-    "A1J4U4": {"isin": "NL0010273215", "name": "ASML Holding N.V.", "yahoo": "ASME.DE", "country": "Europa (ex DE)", "sector": "Technologie", "type": "Aktie"},
-    "NL0010273215": {"isin": "NL0010273215", "name": "ASML Holding N.V.", "yahoo": "ASME.DE", "country": "Europa (ex DE)", "sector": "Technologie", "type": "Aktie"},
+    "ASML": {"isin": "NL0010273215", "name": "ASML Holding N.V.", "yahoo": "ASML", "de_ticker": "ASME.DE", "country": "Europa (ex DE)", "sector": "Technologie", "type": "Aktie"},
+    "A1J4U4": {"isin": "NL0010273215", "name": "ASML Holding N.V.", "yahoo": "ASML", "de_ticker": "ASME.DE", "country": "Europa (ex DE)", "sector": "Technologie", "type": "Aktie"},
+    "NL0010273215": {"isin": "NL0010273215", "name": "ASML Holding N.V.", "yahoo": "ASML", "de_ticker": "ASME.DE", "country": "Europa (ex DE)", "sector": "Technologie", "type": "Aktie"},
 
-    "AVGO": {"isin": "US11135F1012", "name": "Broadcom Inc.", "yahoo": "1YD.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
-    "A2JG9Z": {"isin": "US11135F1012", "name": "Broadcom Inc.", "yahoo": "1YD.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
-    "US11135F1012": {"isin": "US11135F1012", "name": "Broadcom Inc.", "yahoo": "1YD.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "AVGO": {"isin": "US11135F1012", "name": "Broadcom Inc.", "yahoo": "AVGO", "de_ticker": "1YD.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "A2JG9Z": {"isin": "US11135F1012", "name": "Broadcom Inc.", "yahoo": "AVGO", "de_ticker": "1YD.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "US11135F1012": {"isin": "US11135F1012", "name": "Broadcom Inc.", "yahoo": "AVGO", "de_ticker": "1YD.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
 
-    "MUV2.DE": {"isin": "DE0008430026", "name": "Münchener Rück AG", "yahoo": "MUV2.DE", "country": "Deutschland", "sector": "Finanzen", "type": "Aktie"},
-    "843002": {"isin": "DE0008430026", "name": "Münchener Rück AG", "yahoo": "MUV2.DE", "country": "Deutschland", "sector": "Finanzen", "type": "Aktie"},
-    "DE0008430026": {"isin": "DE0008430026", "name": "Münchener Rück AG", "yahoo": "MUV2.DE", "country": "Deutschland", "sector": "Finanzen", "type": "Aktie"},
+    "MUV2.DE": {"isin": "DE0008430026", "name": "Münchener Rück AG", "yahoo": "MUV2.DE", "de_ticker": "MUV2.DE", "country": "Deutschland", "sector": "Finanzen", "type": "Aktie"},
+    "843002": {"isin": "DE0008430026", "name": "Münchener Rück AG", "yahoo": "MUV2.DE", "de_ticker": "MUV2.DE", "country": "Deutschland", "sector": "Finanzen", "type": "Aktie"},
+    "DE0008430026": {"isin": "DE0008430026", "name": "Münchener Rück AG", "yahoo": "MUV2.DE", "de_ticker": "MUV2.DE", "country": "Deutschland", "sector": "Finanzen", "type": "Aktie"},
 
-    "AAPL": {"isin": "US0378331005", "name": "Apple Inc.", "yahoo": "APC.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
-    "865985": {"isin": "US0378331005", "name": "Apple Inc.", "yahoo": "APC.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
-    "US0378331005": {"isin": "US0378331005", "name": "Apple Inc.", "yahoo": "APC.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "AAPL": {"isin": "US0378331005", "name": "Apple Inc.", "yahoo": "AAPL", "de_ticker": "APC.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "865985": {"isin": "US0378331005", "name": "Apple Inc.", "yahoo": "AAPL", "de_ticker": "APC.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "US0378331005": {"isin": "US0378331005", "name": "Apple Inc.", "yahoo": "AAPL", "de_ticker": "APC.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
 
-    "MSFT": {"isin": "US5949181045", "name": "Microsoft Corp.", "yahoo": "MSF.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
-    "870747": {"isin": "US5949181045", "name": "Microsoft Corp.", "yahoo": "MSF.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
-    "US5949181045": {"isin": "US5949181045", "name": "Microsoft Corp.", "yahoo": "MSF.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "MSFT": {"isin": "US5949181045", "name": "Microsoft Corp.", "yahoo": "MSFT", "de_ticker": "MSF.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "870747": {"isin": "US5949181045", "name": "Microsoft Corp.", "yahoo": "MSFT", "de_ticker": "MSF.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "US5949181045": {"isin": "US5949181045", "name": "Microsoft Corp.", "yahoo": "MSFT", "de_ticker": "MSF.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
 
-    "AMZN": {"isin": "US0231351067", "name": "Amazon.com Inc.", "yahoo": "AMZ.DE", "country": "USA", "sector": "Konsumgüter", "type": "Aktie"},
-    "906866": {"isin": "US0231351067", "name": "Amazon.com Inc.", "yahoo": "AMZ.DE", "country": "USA", "sector": "Konsumgüter", "type": "Aktie"},
-    "US0231351067": {"isin": "US0231351067", "name": "Amazon.com Inc.", "yahoo": "AMZ.DE", "country": "USA", "sector": "Konsumgüter", "type": "Aktie"},
+    "AMZN": {"isin": "US0231351067", "name": "Amazon.com Inc.", "yahoo": "AMZN", "de_ticker": "AMZ.DE", "country": "USA", "sector": "Konsumgüter", "type": "Aktie"},
+    "906866": {"isin": "US0231351067", "name": "Amazon.com Inc.", "yahoo": "AMZN", "de_ticker": "AMZ.DE", "country": "USA", "sector": "Konsumgüter", "type": "Aktie"},
+    "US0231351067": {"isin": "US0231351067", "name": "Amazon.com Inc.", "yahoo": "AMZN", "de_ticker": "AMZ.DE", "country": "USA", "sector": "Konsumgüter", "type": "Aktie"},
 
-    "TSLA": {"isin": "US88160R1014", "name": "Tesla Inc.", "yahoo": "TL0.DE", "country": "USA", "sector": "Konsumgüter", "type": "Aktie"},
-    "A1CX3T": {"isin": "US88160R1014", "name": "Tesla Inc.", "yahoo": "TL0.DE", "country": "USA", "sector": "Konsumgüter", "type": "Aktie"},
-    "US88160R1014": {"isin": "US88160R1014", "name": "Tesla Inc.", "yahoo": "TL0.DE", "country": "USA", "sector": "Konsumgüter", "type": "Aktie"},
+    "TSLA": {"isin": "US88160R1014", "name": "Tesla Inc.", "yahoo": "TSLA", "de_ticker": "TL0.DE", "country": "USA", "sector": "Konsumgüter", "type": "Aktie"},
+    "A1CX3T": {"isin": "US88160R1014", "name": "Tesla Inc.", "yahoo": "TSLA", "de_ticker": "TL0.DE", "country": "USA", "sector": "Konsumgüter", "type": "Aktie"},
+    "US88160R1014": {"isin": "US88160R1014", "name": "Tesla Inc.", "yahoo": "TSLA", "de_ticker": "TL0.DE", "country": "USA", "sector": "Konsumgüter", "type": "Aktie"},
 
-    "META": {"isin": "US30303M1027", "name": "Meta Platforms Inc.", "yahoo": "FB2A.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
-    "A1JWVX": {"isin": "US30303M1027", "name": "Meta Platforms Inc.", "yahoo": "FB2A.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
-    "US30303M1027": {"isin": "US30303M1027", "name": "Meta Platforms Inc.", "yahoo": "FB2A.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "META": {"isin": "US30303M1027", "name": "Meta Platforms Inc.", "yahoo": "META", "de_ticker": "FB2A.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "A1JWVX": {"isin": "US30303M1027", "name": "Meta Platforms Inc.", "yahoo": "META", "de_ticker": "FB2A.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
+    "US30303M1027": {"isin": "US30303M1027", "name": "Meta Platforms Inc.", "yahoo": "META", "de_ticker": "FB2A.DE", "country": "USA", "sector": "Technologie", "type": "Aktie"},
 
-    "A1JX52": {"isin": "IE00B3RBWM25", "name": "Vanguard FTSE All-World UCITS ETF (Dist)", "yahoo": "VGWL.DE", "country": "Global", "sector": "Breit gestreut (Welt)", "type": "ETF"},
-    "IE00B3RBWM25": {"isin": "IE00B3RBWM25", "name": "Vanguard FTSE All-World UCITS ETF (Dist)", "yahoo": "VGWL.DE", "country": "Global", "sector": "Breit gestreut (Welt)", "type": "ETF"},
-    "A2PKXG": {"isin": "IE00BK5BQT80", "name": "Vanguard FTSE All-World UCITS ETF (Acc)", "yahoo": "VWCE.DE", "country": "Global", "sector": "Breit gestreut (Welt)", "type": "ETF"},
-    "IE00BK5BQT80": {"isin": "IE00BK5BQT80", "name": "Vanguard FTSE All-World UCITS ETF (Acc)", "yahoo": "VWCE.DE", "country": "Global", "sector": "Breit gestreut (Welt)", "type": "ETF"},
-    "A0RPWH": {"isin": "IE00B4L5Y983", "name": "iShares Core MSCI World UCITS ETF", "yahoo": "EUNL.DE", "country": "Global", "sector": "Breit gestreut (Welt)", "type": "ETF"},
-    "IE00B4L5Y983": {"isin": "IE00B4L5Y983", "name": "iShares Core MSCI World UCITS ETF", "yahoo": "EUNL.DE", "country": "Global", "sector": "Breit gestreut (Welt)", "type": "ETF"},
+    "A1JX52": {"isin": "IE00B3RBWM25", "name": "Vanguard FTSE All-World UCITS ETF (Dist)", "yahoo": "VGWL.DE", "de_ticker": "VGWL.DE", "country": "Global", "sector": "Breit gestreut (Welt)", "type": "ETF"},
+    "IE00B3RBWM25": {"isin": "IE00B3RBWM25", "name": "Vanguard FTSE All-World UCITS ETF (Dist)", "yahoo": "VGWL.DE", "de_ticker": "VGWL.DE", "country": "Global", "sector": "Breit gestreut (Welt)", "type": "ETF"},
+    "A2PKXG": {"isin": "IE00BK5BQT80", "name": "Vanguard FTSE All-World UCITS ETF (Acc)", "yahoo": "VWCE.DE", "de_ticker": "VWCE.DE", "country": "Global", "sector": "Breit gestreut (Welt)", "type": "ETF"},
+    "IE00BK5BQT80": {"isin": "IE00BK5BQT80", "name": "Vanguard FTSE All-World UCITS ETF (Acc)", "yahoo": "VWCE.DE", "de_ticker": "VWCE.DE", "country": "Global", "sector": "Breit gestreut (Welt)", "type": "ETF"},
+    "A0RPWH": {"isin": "IE00B4L5Y983", "name": "iShares Core MSCI World UCITS ETF", "yahoo": "EUNL.DE", "de_ticker": "EUNL.DE", "country": "Global", "sector": "Breit gestreut (Welt)", "type": "ETF"},
+    "IE00B4L5Y983": {"isin": "IE00B4L5Y983", "name": "iShares Core MSCI World UCITS ETF", "yahoo": "EUNL.DE", "de_ticker": "EUNL.DE", "country": "Global", "sector": "Breit gestreut (Welt)", "type": "ETF"},
 }
 
 LOOKTHROUGH_DATABASE = {
@@ -130,6 +131,37 @@ LOOKTHROUGH_DATABASE = {
         }
     }
 }
+
+# ==========================================
+# LIVE WECHSELKURS CACHE (EUR/USD, EUR/CHF, EUR/GBP)
+# ==========================================
+_fx_cache = {"rates": {"EUR": 1.0, "USD": 1.055, "CHF": 0.935, "GBP": 0.835}, "ts": 0}
+
+def get_live_fx_rates() -> dict:
+    now = time.time()
+    if now - _fx_cache["ts"] < 120:
+        return _fx_cache["rates"]
+    try:
+        pairs = {"USD": "EURUSD=X", "CHF": "EURCHF=X", "GBP": "EURGBP=X"}
+        updated = _fx_cache["rates"].copy()
+        for cur, sym in pairs.items():
+            t = yf.Ticker(sym)
+            p = getattr(t.fast_info, "last_price", None)
+            if p and p > 0:
+                updated[cur] = float(p)
+        _fx_cache["rates"] = updated
+        _fx_cache["ts"] = now
+    except Exception as e:
+        logger.warning("FX-Update Fehler: %s", e)
+    return _fx_cache["rates"]
+
+def convert_to_eur_live(amount: float, currency: str) -> float:
+    cur = (currency or "EUR").upper()
+    if cur == "EUR":
+        return amount
+    rates = get_live_fx_rates()
+    rate = rates.get(cur, 1.0)
+    return amount / rate if rate > 0 else amount
 
 # ==========================================
 # GOOGLE DRIVE CLOUD-FUNKTIONEN
@@ -189,78 +221,68 @@ def load_from_gdrive() -> dict | None:
     return json.loads(fh.read().decode("utf-8"))
 
 # ==========================================
-# TRADEGATE + YAHOO HYBRID-KURSABFRAGE
+# LANG & SCHWARZ (EUR 07:30-23:00) + LIVE FX
 # ==========================================
-def parse_german_float(val) -> float | None:
-    if val is None:
-        return None
-    if isinstance(val, (int, float)):
-        return float(val) if val > 0 else None
-    s = str(val).strip().replace(".", "").replace(",", ".")
-    try:
-        num = float(s)
-        return num if num > 0 else None
-    except ValueError:
-        return None
-
-def fetch_tradegate_quote(isin: str) -> dict | None:
-    """Fragt Live-Euro-Kurse direkt von Tradegate (07:30 - 22:00 Uhr) ab."""
+def fetch_lang_und_schwarz_eur(isin: str) -> dict | None:
+    """Fragt den Echtzeit-Euro-Kurs von Lang & Schwarz (Trade Republic Referenzmarkt) ab."""
     if not isin or len(isin) != 12:
         return None
     try:
-        url = f"https://data.tradegate.de/kurse.php?isin={isin}"
+        url = f"https://www.ls-tc.de/de/aktie/{isin.lower()}"
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Referer": "https://www.tradegate.de/"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept-Language": "de-DE,de;q=0.9"
         }
         r = requests.get(url, headers=headers, timeout=4)
         if not r.ok:
             return None
-        data = r.json()
-        if not isinstance(data, dict) or data.get("error"):
-            return None
+        html = r.text
+        # L&S bettet Kursdaten als JSON/Attribute im HTML ein (z.B. field="mid" oder "bid"/"ask")
+        m_mid = re.search(r'field=["\']mid["\'][^>]*>([\d.,]+)<', html)
+        m_bid = re.search(r'field=["\']bid["\'][^>]*>([\d.,]+)<', html)
+        m_ask = re.search(r'field=["\']ask["\'][^>]*>([\d.,]+)<', html)
+        m_pct = re.search(r'field=["\']changePercent["\'][^>]*>([+-]?[\d.,]+)', html)
 
-        last_p = parse_german_float(data.get("last"))
-        bid_p = parse_german_float(data.get("bid"))
-        ask_p = parse_german_float(data.get("ask"))
-        close_p = parse_german_float(data.get("close"))
+        def to_f(m):
+            if not m:
+                return None
+            val = float(m.group(1).replace(".", "").replace(",", "."))
+            return val if val > 0 else None
 
-        price = last_p or (round((bid_p + ask_p) / 2, 2) if (bid_p and ask_p) else (bid_p or ask_p or close_p))
+        mid_p = to_f(m_mid)
+        bid_p = to_f(m_bid)
+        ask_p = to_f(m_ask)
+        price = mid_p or (round((bid_p + ask_p) / 2, 2) if (bid_p and ask_p) else (bid_p or ask_p))
+
         if not price or price <= 0:
             return None
 
         chg_pct = 0.0
-        delta_raw = data.get("delta")
-        if delta_raw is not None:
-            parsed_delta = parse_german_float(str(delta_raw).replace("%", "").replace("+", ""))
-            if parsed_delta is not None:
-                chg_pct = -parsed_delta if str(delta_raw).strip().startswith("-") else parsed_delta
-        elif close_p and close_p > 0:
-            chg_pct = ((price - close_p) / close_p) * 100.0
+        if m_pct:
+            try:
+                chg_pct = float(m_pct.group(1).replace(".", "").replace(",", "."))
+            except ValueError:
+                pass
 
         return {
             "status": "success",
             "price": round(price, 2),
             "changePct": round(chg_pct, 2),
             "currency": "EUR",
-            "source": "Tradegate"
+            "source": "Lang & Schwarz (EUR)"
         }
     except Exception as e:
-        logger.debug("Tradegate-Abruf für %s nicht verfügbar: %s", isin, e)
+        logger.debug("L&S Abruf für %s nicht möglich: %s", isin, e)
         return None
 
 def yahoo_search_metadata(query: str) -> dict:
-    """Sucht über die Yahoo-Search-API nach offiziellem Namen, ISIN und Ticker."""
     try:
         url = f"https://query2.finance.yahoo.com/v1/finance/search?q={requests.utils.quote(query)}&quotesCount=5&newsCount=0"
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=4)
         if r.ok:
             quotes = r.json().get("quotes", [])
             if quotes:
-                # Bevorzuge deutsche Börsenplätze (.DE), falls vorhanden
-                de_match = next((q for q in quotes if str(q.get("symbol", "")).endswith(".DE")), None)
-                best = de_match or quotes[0]
+                best = quotes[0]
                 return {
                     "symbol": best.get("symbol", query),
                     "name": best.get("longname") or best.get("shortname") or "",
@@ -294,48 +316,39 @@ def fetch_single_quote(identifier: str):
     orig_id = identifier.strip().upper()
     sec = resolve_security_info(orig_id)
 
-    # 1. Primär: Tradegate Live-Kurs in EUR (07:30 - 22:00 Uhr), falls ISIN bekannt
+    # 1. Primär: Lang & Schwarz Echtzeit-Euro-Kurs (07:30 - 23:00 Uhr), falls ISIN vorhanden
     if sec.get("isin"):
-        tg_res = fetch_tradegate_quote(sec["isin"])
-        if tg_res and tg_res.get("status") == "success":
-            return orig_id, tg_res
+        ls_res = fetch_lang_und_schwarz_eur(sec["isin"])
+        if ls_res and ls_res.get("status") == "success":
+            return orig_id, ls_res
 
-    # 2. Sekundär: Yahoo Finance Fallback (bevorzugt .DE Euro-Ticker)
+    # 2. Sekundär: Yahoo Finance (Heimatbörse z.B. GOOGL bis 22:00 Uhr + Live-FX Umrechnung in EUR)
     yahoo_sym = sec.get("yahoo") or orig_id
     try:
         ticker = yf.Ticker(yahoo_sym)
-        hist = ticker.history(period="2d")
-        if hist.empty:
-            info = ticker.fast_info
-            price = getattr(info, "last_price", None) or getattr(info, "regular_market_price", None)
-            prev = getattr(info, "previous_close", None) or price
-            cur = getattr(info, "currency", "EUR" if yahoo_sym.endswith(".DE") else "USD")
-            chg = (((price - prev) / prev) * 100) if prev and price else 0.0
-            if price:
-                return orig_id, {
-                    "status": "success",
-                    "price": round(float(price), 2),
-                    "changePct": round(float(chg), 2),
-                    "currency": cur,
-                    "source": "Yahoo"
-                }
+        info = ticker.fast_info
+        price = getattr(info, "last_price", None) or getattr(info, "regular_market_price", None)
+        prev = getattr(info, "previous_close", None) or price
+        raw_cur = getattr(info, "currency", "EUR" if yahoo_sym.endswith(".DE") else "USD")
+
+        if not price:
+            hist = ticker.history(period="2d")
+            if not hist.empty:
+                price = float(hist["Close"].iloc[-1])
+                prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else price
+
+        if not price or price <= 0:
             return orig_id, {"status": "not_found"}
 
-        current_price = float(hist["Close"].iloc[-1])
-        prev_close = float(hist["Close"].iloc[-2]) if len(hist) > 1 else current_price
-        chg_pct = ((current_price - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
-        cur = "EUR" if yahoo_sym.endswith(".DE") else "USD"
-        try:
-            cur = ticker.fast_info.currency or cur
-        except Exception:
-            pass
+        chg_pct = (((price - prev) / prev) * 100) if prev and prev > 0 else 0.0
+        price_eur = convert_to_eur_live(float(price), raw_cur)
 
         return orig_id, {
             "status": "success",
-            "price": round(current_price, 2),
-            "changePct": round(chg_pct, 2),
-            "currency": cur,
-            "source": "Yahoo"
+            "price": round(price_eur, 2),
+            "changePct": round(float(chg_pct), 2),
+            "currency": "EUR",
+            "source": f"Yahoo ({yahoo_sym} -> Live-EUR)"
         }
     except Exception as ex:
         logger.warning("Quote-Fehler für %s (%s): %s", orig_id, yahoo_sym, ex)
@@ -350,8 +363,9 @@ def health_check():
     return {
         "status": "online",
         "service": "Market Desk Proxy & Cloud Engine",
-        "version": "3.2-Tradegate-GDrive",
-        "gdrive_connected": gdrive_configured
+        "version": "3.3-LS-LiveFX-GDrive",
+        "gdrive_connected": gdrive_configured,
+        "live_fx": get_live_fx_rates()
     }
 
 @app.post("/save-portfolio")
@@ -361,7 +375,6 @@ async def save_portfolio(request: Request):
         with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         gdrive_ok = save_to_gdrive(data)
-        logger.info("Depot gespeichert (%d Positionen, Google Drive: %s).", len(data.get("holdings", [])), gdrive_ok)
         return {
             "status": "success",
             "storage": "google_drive" if gdrive_ok else "local_fallback"
@@ -418,7 +431,7 @@ def quote_deep(query: str = ""):
             "name": base["name"],
             "type": base["type"],
             "country": base["country"],
-            "currency": base["currency"],
+            "currency": "EUR",
             "sector": base["sector"],
             "price": price,
             "breakdown": base.get("breakdown")
@@ -428,35 +441,15 @@ def quote_deep(query: str = ""):
     _, quote_res = fetch_single_quote(clean)
 
     name = sec.get("name") or clean
-    cur = quote_res.get("currency") or "EUR"
     price = quote_res.get("price") if quote_res.get("status") == "success" else None
-    country = sec.get("country", "Global")
-    sector = sec.get("sector", "Technologie")
-    sec_type = sec.get("type", "Aktie")
-
-    # Zusätzliche Metadaten über yfinance versuchen, falls Name noch dem Kürzel entspricht
-    if name == clean:
-        try:
-            t = yf.Ticker(sec.get("yahoo") or clean)
-            info = t.info or {}
-            name = info.get("longName") or info.get("shortName") or clean
-            c_raw = info.get("country")
-            if c_raw in ["United States", "US"]:
-                country = "USA"
-            elif c_raw == "Germany":
-                country = "Deutschland"
-            if info.get("sector"):
-                sector = info.get("sector")
-        except Exception:
-            pass
 
     return {
         "status": "success",
         "name": name,
-        "type": sec_type,
-        "country": country,
-        "currency": cur,
-        "sector": sector,
+        "type": sec.get("type", "Aktie"),
+        "country": sec.get("country", "Global"),
+        "currency": "EUR",
+        "sector": sec.get("sector", "Technologie"),
         "price": round(float(price), 2) if price else None,
         "source": quote_res.get("source", "Hybrid")
     }
